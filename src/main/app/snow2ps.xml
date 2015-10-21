@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:servicenow="http://www.mulesoft.org/schema/mule/servicenow"
+	xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking"
+	xmlns:json="http://www.mulesoft.org/schema/mule/json" xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:peoplesoft="http://www.mulesoft.org/schema/mule/peoplesoft"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/peoplesoft http://www.mulesoft.org/schema/mule/peoplesoft/current/mule-peoplesoft.xsd
+http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/json http://www.mulesoft.org/schema/mule/json/current/mule-json.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/servicenow http://www.mulesoft.org/schema/mule/servicenow/current/mule-servicenow.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd">
+	<http:listener-config name="HTTP_Listener_Configuration"
+		host="0.0.0.0" port="8081" doc:name="HTTP Listener Configuration" />
+	<peoplesoft:config name="PeopleSoft__Configuration"
+		server="${peoplesoft.server}" username="${peoplesoft.username}"
+		password="${peoplesoft.password}" doc:name="PeopleSoft: Configuration">
+		<peoplesoft:component-interface-ids-white-list>
+			<peoplesoft:component-interface-ids-white-list>CI_PERSONAL_DATA</peoplesoft:component-interface-ids-white-list>
+		</peoplesoft:component-interface-ids-white-list>
+	</peoplesoft:config>
+	<servicenow:config name="ServiceNow__configuration"
+		username="${snow.user}" password="${snow.password}" doc:name="ServiceNow: configuration"
+		serviceAddress="${snow.url}">
+	</servicenow:config>
+	
+	<flow name="snow2ps" processingStrategy="synchronous">
+		<poll doc:name="Poll">
+			<fixed-frequency-scheduler frequency="30" timeUnit="SECONDS"/>
+			<watermark variable="watermark"
+				default-expression="#[server.dateTime.plusHours(-1).format('yyyy-MM-dd HH:mm:ss')]"
+				selector="MAX"
+				selector-expression="#[payload.sys_created_on]" />
+			<processor-chain doc:name="Processor Chain">
+				<dw:transform-message doc:name="Transform Message">
+					<dw:set-payload><![CDATA[%dw 1.0
+%output application/xml
+%namespace ns0 http://www.service-now.com/sys_user
+---
+{
+	ns0#getRecords: {
+		ns0#"__encoded_query": 'sys_created_on > ' ++ flowVars.watermark as :string {format: "yyyy-MM-dd HH:mm:ss"}
+	}
+}]]></dw:set-payload>
+				</dw:transform-message>
+                <logger message="watermark == #[watermark]" level="INFO" doc:name="Logger"/>
+				<servicenow:invoke config-ref="ServiceNow__configuration"
+					type="sys_user||getRecords" doc:name="ServiceNow" />
+                
+                <dw:transform-message doc:name="Transform Message">
+                    <dw:input-payload doc:sample="getRecordsResponse.xml"/>
+                    <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+%namespace ns0 http://www.service-now.com/sys_user
+---
+flatten [payload.ns0#getRecordsResponse.ns0#getRecordsResult] when payload.ns0#getRecordsResponse !='' otherwise []]]></dw:set-payload>
+                </dw:transform-message>
+                
+			</processor-chain>
+		</poll>
+	
+		<foreach doc:name="For Each">
+			<logger message="Begining of flow#[payload.first_name+' ' +payload.last_name] " level="INFO"
+				doc:name="Logger" />
+            <set-variable variableName="employee_number" value="#[payload.employee_number]" doc:name="emplyee_number"/>
+            <set-variable variableName="employee_name" value="#[payload.first_name+' '+payload.last_name]" doc:name="employee_name"/>
+            <tracking:custom-event event-name="New User in SNOW" doc:name="New User in SNOW">
+                <tracking:meta-data key="employee_number" value="#[employee_number]"/>
+                <tracking:meta-data key="employee_name" value="#[employee_name] "/>
+            </tracking:custom-event>
+			<enricher source="#[payload]" target="#[flowVars['psCreateResult']]"
+				doc:name="Message Enricher">
+				<processor-chain doc:name="Processor Chain">
+					<dw:transform-message doc:name="Map to CI_PERSONAL_DATA">
+						<dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+%namespace ns0 http://www.service-now.com/sys_user
+---
+{
+	KEYPROP_EMPLID: payload.ns0#"employee_number"
+}]]></dw:set-payload>
+					</dw:transform-message>
+                    <logger message="#[payload]" level="INFO" doc:name="Logger"/>
+					<peoplesoft:invoke-operation
+						config-ref="PeopleSoft__Configuration" key="CI_PERSONAL_DATA||Create"
+						doc:name="Create" />
+				</processor-chain>
+			</enricher>
+			<dw:transform-message doc:name="Map to CI_PERSONAL_DATA">
+				<dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+%namespace ns0 http://www.service-now.com/sys_user
+---
+{
+	"COLL_DIVERS_ETHNIC": {
+      "KEYPROP_REG_REGION": "USA",
+      "PROP_PRIMARY_INDICATOR": "N"
+    },
+    "COLL_DIVERS_RELIGION": {
+      "KEYPROP_REG_REGION": "USA",
+      "PROP_BLOOD_TYPE": "U"
+    },
+    "COLL_EMAIL_ADDRESSES": {
+      "KEYPROP_E_ADDR_TYPE": "HOME",
+      "PROP_EMAIL_ADDR": "mule@gmail.com",
+      "PROP_PREF_EMAIL_FLAG": "Y"
+    },
+    "COLL_NAME_TYPE_VW": {
+      "COLL_NAMES": {
+      	"KEYPROP_NAME_TYPE": "PRI",
+        "KEYPROP_EFFDT": |1988-07-07|,
+        "PROP_COUNTRY_NM_FORMAT": "001",
+        "PROP_FIRST_NAME": payload.first_name,
+        "PROP_LAST_NAME": payload.last_name,
+        "PROP_MIDDLE_NAME": "",
+        "PROP_LAST_NAME_PREF_NLD":"1"
+      },
+      "KEYPROP_NAME_TYPE": ""
+    },   
+    "COLL_ADDRESS_TYPE_VW": {
+      "COLL_ADDRESSES": {
+        "KEYPROP_ADDRESS_TYPE": "HOME",
+        "KEYPROP_EFFDT": |1988-07-07|,
+        "PROP_ADDRESS1": "Mi calle 1234",
+        "PROP_ADDRESS1_AC": "",
+        "PROP_ADDRESS2": "",
+        "PROP_ADDRESS2_AC": "",
+        "PROP_ADDRESS3": "",
+        "PROP_ADDRESS3_AC": "",
+        "PROP_ADDRESS4": "",
+        "PROP_ADDR_FIELD1": "",
+        "PROP_ADDR_FIELD2": "",
+        "PROP_ADDR_FIELD3": "",
+        "PROP_CITY": "",
+        "PROP_CITY_AC": "Tanjong Pagar, Singapore",
+        "PROP_COUNTRY": "SGP",
+        "PROP_COUNTY": "",
+        "PROP_EFF_STATUS": "A",
+        "PROP_GEO_CODE": "",
+        "PROP_HOUSE_TYPE": "",
+        "PROP_IN_CITY_LIMIT": "",
+        "PROP_NUM1": "",
+        "PROP_NUM2": "",
+        "PROP_POSTAL": "",
+        "PROP_REG_REGION": "USA",
+        "PROP_STATE": ""
+      },
+      "KEYPROP_ADDRESS_TYPE": "HOME"
+    },    
+    "COLL_PERSONAL_PHONE": {
+      "KEYPROP_PHONE_TYPE": "MAIN",
+      "PROP_COUNTRY_CODE": "",
+      "PROP_EXTENSION": "",
+      "PROP_PHONE": "43567878",
+      "PROP_PREF_PHONE_FLAG": "Y"
+    },
+    "COLL_NATIONALITY_GER": {
+      "KEYPROP_NATIONALITY_DT": |1988-07-07|
+    },
+    "COLL_PERSONAL_PHONE": {
+      "KEYPROP_PHONE_TYPE": "MAIN",
+      "PROP_PHONE": "43567878",
+      "PROP_PREF_PHONE_FLAG": "Y"
+    },  
+    "COLL_PERS_NID": {
+      "KEYPROP_COUNTRY": "USA",
+      "KEYPROP_NATIONAL_ID_TYPE": "PR",
+      "PROP_EXPIRY_DATE": "",
+      "PROP_NATIONAL_ID": "XXX-XX-XXXX",
+      "PROP_PRIMARY_NID": "Y",
+      "PROP_SSN_KEY_FRA": "",
+      "PROP_TAX_REF_ID_SGP": "NO"
+    },
+    "COLL_PERS_DATA_BRA": {
+      "KEYPROP_EFFDT": |1988-07-07|
+    },
+    "COLL_PERS_DATA_CAN": {
+      "KEYPROP_EFFDT": |1988-07-07|
+    },
+    "COLL_PERS_DATA_DEU": {
+      "KEYPROP_EFFDT": |1988-07-07|
+    },
+    "COLL_PERS_DATA_ESP": {
+      "KEYPROP_EFFDT": |1988-07-07|
+    },
+    "COLL_PERS_DATA_FRA": {
+      "KEYPROP_EFFDT": |1988-07-07|
+    },
+    "COLL_PERS_DATA_ITA": {
+      "KEYPROP_EFFDT": |1988-07-07|
+    },
+    "COLL_PERS_DATA_JPN": {
+      "KEYPROP_EFFDT": |1988-07-07|
+    },
+    "COLL_PERS_DATA_MEX": {
+      "KEYPROP_EFFDT": |1988-07-07|
+    },
+    "COLL_PERS_DATA_USA": {
+      "KEYPROP_EFFDT": |1988-07-07|,
+      "PROP_US_WORK_ELIGIBILTY": "Y"
+    },
+    "COLL_PLACE_ORIG_CHE": {
+      "PROP_MAIN_ORIG_CHE": "N"
+    },
+    "KEYPROP_EMPLID": payload.employee_number,
+    "PROP_BIRTHDATE": |1988-07-07|,
+    "PROP_CAN_ABORIGINAL": "N",
+    "PROP_CAN_VISBL_MINORITY": "N",
+    "PROP_DERIVED_CWR": "N",
+    "PROP_DERIVED_EMP": "Y",
+    "PROP_DERIVED_POI": "N",
+    "PROP_DT_OF_DEATH": |1988-07-07|,
+    "PROP_WAIVE_DATA_PROTECT": "N"
+}]]></dw:set-payload>
+			</dw:transform-message>
+            <logger level="INFO" doc:name="Logger" message="Payload to peoplesoft: #[payload]"/>
+			<peoplesoft:invoke-operation config-ref="PeopleSoft__Configuration"
+				key="CI_PERSONAL_DATA||Save" doc:name="Save" />
+            <logger message="Payload from Peoplesoft: #[payload]" level="INFO" doc:name="Logger"/>
+
+			<tracking:custom-event event-name="User Created in PeopleSoft" doc:name="User Created in PeopleSoft">
+                <tracking:meta-data key="employee_number" value="#[employee_number]"/>
+                <tracking:meta-data key="employee_name" value="#[employee_name] "/>
+            </tracking:custom-event>
+
+		</foreach>
+		<logger message="Now we are done! #[payload]" level="INFO" doc:name="Logger" />
+
+	</flow>
+    
+</mule>
